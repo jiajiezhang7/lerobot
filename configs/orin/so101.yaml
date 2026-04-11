@@ -1,0 +1,42 @@
+# Orin SO101 deployment template
+# Required interface keys:
+# robot.port
+# teleop.port
+# robot.id
+# teleop.id
+# robot.cameras
+
+robot:
+  type: so101_follower
+  port: /dev/ttyACM1
+  id: so101-follower-orin
+  cameras:
+    front:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+
+teleop:
+  type: so101_leader
+  port: /dev/ttyACM0
+  id: so101-leader-orin
+
+fps: 30
+
+dataset:
+  repo_id_template: "${HF_USER}/so101_orin_{mode}"
+  streaming_encoding: true
+  encoder_threads: 2
+  display_data: false
+
+policy:
+  mode: local_act
+  device: cuda
+  async_enabled: false
+  rtc_enabled: false
+  rtc:
+    execution_horizon: 10
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: EXP
