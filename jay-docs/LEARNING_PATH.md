@@ -422,6 +422,7 @@ camera_config = {
 2. `docs/source/so100.mdx` / `so101.mdx` - SO 系列教程
 3. `docs/source/cameras.mdx` - 相机设置
 4. `docs/source/phone_teleop.mdx` - 手机遥操作
+5. `jay-docs/SO101_DISTRIBUTED_DEPLOYMENT.md` - SO-ARM101 双机部署实战：本地控制机 + 远端 GPU server
 
 ---
 
