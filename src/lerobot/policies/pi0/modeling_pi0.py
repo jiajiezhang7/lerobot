@@ -565,23 +565,30 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             raise ValueError(
                 f"PaliGemma expects square image resolution, invalid resolution: {config.image_resolution}"
             )
+        init_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
+        previous_default_dtype = torch.get_default_dtype()
+        if previous_default_dtype != init_dtype:
+            torch.set_default_dtype(init_dtype)
+        try:
+            self.paligemma_with_expert = PaliGemmaWithExpertModel(
+                paligemma_config,
+                action_expert_config,
+                use_adarms=[False, False],
+                precision=config.dtype,
+                image_size=config.image_resolution[0],
+                freeze_vision_encoder=config.freeze_vision_encoder,
+                train_expert_only=config.train_expert_only,
+            )
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
-            action_expert_config,
-            use_adarms=[False, False],
-            precision=config.dtype,
-            image_size=config.image_resolution[0],
-            freeze_vision_encoder=config.freeze_vision_encoder,
-            train_expert_only=config.train_expert_only,
-        )
+            self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+            self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
-
-        self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
-        self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
-        self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
+            self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+            self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        finally:
+            if torch.get_default_dtype() != previous_default_dtype:
+                torch.set_default_dtype(previous_default_dtype)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -690,8 +697,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = []
         att_masks = []
 
-        if self.state_proj.weight.dtype == torch.float32:
-            state = state.to(torch.float32)
+        state = state.to(self.state_proj.weight.dtype)
 
         def state_proj_func(state):
             return self.state_proj(state)
@@ -719,10 +725,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
+        noisy_actions = noisy_actions.to(self.action_in_proj.weight.dtype)
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
+        time_emb = time_emb.to(action_emb.dtype)
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        action_time_emb = action_time_emb.to(self.action_time_mlp_in.weight.dtype)
 
         def mlp_func(action_time_emb):
             x = self.action_time_mlp_in(action_time_emb)
@@ -797,12 +806,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = v_t.to(dtype=torch.float32)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -927,8 +937,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+        return self.action_out_proj(suffix_out).to(dtype=torch.float32)
 
 
 class PI0Policy(PreTrainedPolicy):
@@ -940,6 +950,7 @@ class PI0Policy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI0Config,
+        init_on_meta: bool = False,
         **kwargs,
     ):
         """
@@ -952,13 +963,18 @@ class PI0Policy(PreTrainedPolicy):
 
         # Initialize the core PI0 model
         self.init_rtc_processor()
-        self.model = PI0Pytorch(config, rtc_processor=self.rtc_processor)
+        if init_on_meta:
+            with torch.device("meta"):
+                self.model = PI0Pytorch(config, rtc_processor=self.rtc_processor)
+        else:
+            self.model = PI0Pytorch(config, rtc_processor=self.rtc_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        if not init_on_meta:
+            self.model.to(config.device)
 
         self.reset()
 
@@ -1001,10 +1017,6 @@ class PI0Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
-
         # Load state dict (expects keys with "model." prefix)
         try:
             print(f"Loading model from: {pretrained_name_or_path}")
@@ -1022,35 +1034,21 @@ class PI0Policy(PreTrainedPolicy):
                     revision=kwargs.get("revision"),
                     local_files_only=kwargs.get("local_files_only", False),
                 )
-                from safetensors.torch import load_file
-
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
+                print("✓ Resolved model.safetensors")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
-                return model
+                return cls(config, **kwargs)
 
-            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+            # Initialize an empty policy on meta and materialize it directly on the target device
+            # so we avoid building a full float32 CPU copy before streaming checkpoint weights in.
+            model = cls(config, init_on_meta=True, **kwargs)
+            model.to_empty(device=torch.device(config.device))
+            model._restore_runtime_buffers_after_to_empty()
 
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
-
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
-
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys, remap_count = model._load_safetensors_streaming(
+                resolved_file, strict=strict
+            )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1080,63 +1078,120 @@ class PI0Policy(PreTrainedPolicy):
 
         return model
 
-    def _fix_pytorch_state_dict_keys(
-        self, state_dict, model_config
+    def _map_checkpoint_key(
+        self, key: str, model_config
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
-        """Fix state dict keys to match current model architecture."""
+        """Map a checkpoint key to one or more model.state_dict keys."""
         import re
 
-        fixed_state_dict = {}
+        # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
+        # For gemma expert layers
+        if re.match(
+            r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
+            key,
+        ):
+            expert_uses_adarms = getattr(
+                self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
+            )
+            if expert_uses_adarms:
+                logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
+                return []
 
-        for key, value in state_dict.items():
-            new_key = key
+        if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
+            expert_uses_adarms = getattr(
+                self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
+            )
+            if expert_uses_adarms:
+                logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
+                return []
 
-            # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
-            # For gemma expert layers
-            if re.match(
-                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
-                key,
-            ):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
+        new_key = key
+        if key.startswith("time_mlp_in."):
+            new_key = key.replace("time_mlp_in.", "action_time_mlp_in.")
+        elif key.startswith("time_mlp_out."):
+            new_key = key.replace("time_mlp_out.", "action_time_mlp_out.")
+
+        if "patch_embedding" in key:
+            logging.warning(f"Vision embedding key might need handling: {key}")
+
+        mapped_keys = []
+        if (
+            key == "model.paligemma_with_expert.paligemma.lm_head.weight"
+            or key == "paligemma_with_expert.paligemma.lm_head.weight"
+        ):
+            mapped_keys.append(
+                "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+            )
+
+        if not new_key.startswith("model."):
+            new_key = f"model.{new_key}"
+
+        mapped_keys.append(new_key)
+        return mapped_keys
+
+    def _load_safetensors_streaming(self, resolved_file: str | Path, strict: bool = True):
+        """Load safetensors directly into model params without materializing the full checkpoint."""
+        from safetensors import safe_open
+
+        model_state = self.state_dict()
+        loaded_keys = set()
+        unexpected_keys = []
+        remap_count = 0
+
+        with safe_open(resolved_file, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                mapped_keys = self._map_checkpoint_key(key, self.config)
+                if not mapped_keys:
                     continue
 
-            if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
-                    continue
+                if not key.startswith("model."):
+                    remap_count += 1
 
-            # Handle MLP naming changes for pi0
-            # non-pi05 model expects action_time_mlp_*, but checkpoint might have time_mlp_*
-            if key.startswith("time_mlp_in."):
-                new_key = key.replace("time_mlp_in.", "action_time_mlp_in.")
-            elif key.startswith("time_mlp_out."):
-                new_key = key.replace("time_mlp_out.", "action_time_mlp_out.")
+                tensor = handle.get_tensor(key)
+                for mapped_key in mapped_keys:
+                    if mapped_key not in model_state:
+                        unexpected_keys.append(mapped_key)
+                        continue
+                    target_tensor = model_state[mapped_key]
+                    if target_tensor.shape != tensor.shape:
+                        unexpected_keys.append(mapped_key)
+                        continue
+                    target_tensor.copy_(tensor)
+                    loaded_keys.add(mapped_key)
+                del tensor
 
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
+        missing_keys = [key for key in model_state if key not in loaded_keys]
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                "Error(s) in loading state_dict for PI0Policy: "
+                f"{len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys"
+            )
 
-            if (
-                key == "model.paligemma_with_expert.paligemma.lm_head.weight"
-                or key == "paligemma_with_expert.paligemma.lm_head.weight"
-            ):
-                fixed_state_dict[
-                    "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-                ] = value.clone()
+        return missing_keys, unexpected_keys, remap_count
 
-            fixed_state_dict[new_key] = value
+    def _restore_runtime_buffers_after_to_empty(self) -> None:
+        """Rebuild non-persistent buffers that `to_empty()` leaves uninitialized."""
+        vision_embeddings = self.model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings
+        position_device = vision_embeddings.position_embedding.weight.device
+        position_ids = torch.arange(
+            vision_embeddings.num_positions,
+            device=position_device,
+            dtype=torch.long,
+        ).expand((1, -1))
+        vision_embeddings.position_ids = position_ids
 
-        return fixed_state_dict
+        rotary_modules = [
+            self.model.paligemma_with_expert.paligemma.model.language_model.rotary_emb,
+            self.model.paligemma_with_expert.gemma_expert.model.rotary_emb,
+        ]
+        for rotary in rotary_modules:
+            inv_freq, attention_scaling = rotary.compute_default_rope_parameters(
+                config=rotary.config,
+                device=rotary.inv_freq.device,
+            )
+            rotary.inv_freq = inv_freq
+            rotary.original_inv_freq = inv_freq.clone()
+            rotary.attention_scaling = attention_scaling
 
     def get_optim_params(self) -> dict:
         return self.parameters()
