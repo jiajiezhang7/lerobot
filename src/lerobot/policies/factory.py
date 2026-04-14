@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib
 import logging
 from typing import Any, TypedDict, Unpack
@@ -271,12 +272,13 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        preprocessor_overrides = copy.deepcopy(kwargs.get("preprocessor_overrides") or {})
+        postprocessor_overrides = copy.deepcopy(kwargs.get("postprocessor_overrides") or {})
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
             # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
             preprocessor_overrides["groot_pack_inputs_v3"] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
@@ -289,8 +291,13 @@ def make_pre_post_processors(
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }
-            kwargs["preprocessor_overrides"] = preprocessor_overrides
-            kwargs["postprocessor_overrides"] = postprocessor_overrides
+
+        if isinstance(policy_cfg, SmolVLAConfig):
+            tokenizer_overrides = preprocessor_overrides.setdefault("tokenizer_processor", {})
+            tokenizer_overrides.setdefault("tokenizer_name", policy_cfg.vlm_model_name)
+
+        kwargs["preprocessor_overrides"] = preprocessor_overrides
+        kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,

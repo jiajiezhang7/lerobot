@@ -15,11 +15,13 @@
 # limitations under the License.
 """Tests for SmolVLA policy processor."""
 
+import json
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.processor_smolvla import (
@@ -117,6 +119,41 @@ def test_make_smolvla_processor_basic():
     assert len(postprocessor.steps) == 2
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+
+
+@patch("lerobot.processor.tokenizer_processor.AutoTokenizer")
+def test_make_pretrained_smolvla_processor_uses_current_vlm_tokenizer(mock_auto_tokenizer, tmp_path):
+    """Loading a pretrained SmolVLA processor should follow the current config tokenizer path."""
+    mock_auto_tokenizer.from_pretrained.return_value = object()
+
+    preprocessor_config = {
+        "name": "policy_preprocessor",
+        "steps": [
+            {
+                "registry_name": "tokenizer_processor",
+                "config": {
+                    "tokenizer_name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+                    "max_length": 48,
+                    "task_key": "task",
+                    "padding_side": "right",
+                    "padding": "max_length",
+                    "truncation": True,
+                },
+            }
+        ],
+    }
+    postprocessor_config = {"name": "policy_postprocessor", "steps": []}
+
+    (tmp_path / "policy_preprocessor.json").write_text(json.dumps(preprocessor_config))
+    (tmp_path / "policy_postprocessor.json").write_text(json.dumps(postprocessor_config))
+
+    config = create_default_config()
+    config.vlm_model_name = str(tmp_path / "local-smolvlm")
+
+    preprocessor, _ = make_pre_post_processors(config, pretrained_path=str(tmp_path))
+
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(config.vlm_model_name)
+    assert preprocessor.steps[0].tokenizer_name == config.vlm_model_name
 
 
 def test_smolvla_newline_processor_single_task():
