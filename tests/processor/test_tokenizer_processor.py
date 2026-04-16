@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.processor import DataProcessorPipeline, TokenizerProcessorStep
+from lerobot.processor import ActionTokenizerProcessorStep, DataProcessorPipeline, TokenizerProcessorStep
 from lerobot.processor.converters import create_transition, identity_transition
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
@@ -356,6 +356,34 @@ def test_get_config_with_tokenizer_object():
 
     assert config == expected
     assert "tokenizer_name" not in config
+
+
+@require_package("transformers")
+@patch("lerobot.processor.tokenizer_processor.AutoTokenizer")
+@patch("lerobot.processor.tokenizer_processor.AutoProcessor")
+def test_action_tokenizer_get_config_with_tokenizer_name(mock_auto_processor, mock_auto_tokenizer):
+    """Test action tokenizer config serialization includes local path-critical fields."""
+    mock_auto_processor.from_pretrained.return_value = object()
+    mock_auto_tokenizer.from_pretrained.return_value = MockTokenizer(vocab_size=100)
+
+    processor = ActionTokenizerProcessorStep(
+        action_tokenizer_name="test-fast-tokenizer",
+        paligemma_tokenizer_name="test-paligemma-tokenizer",
+        max_action_tokens=256,
+        fast_skip_tokens=128,
+    )
+
+    config = processor.get_config()
+
+    expected = {
+        "trust_remote_code": True,
+        "max_action_tokens": 256,
+        "fast_skip_tokens": 128,
+        "paligemma_tokenizer_name": "test-paligemma-tokenizer",
+        "action_tokenizer_name": "test-fast-tokenizer",
+    }
+
+    assert config == expected
 
 
 @require_package("transformers")

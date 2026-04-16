@@ -63,6 +63,8 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Keep only the most recent N step checkpoints on disk. Set to 0 to disable pruning.
+    save_total_limit: int = 0
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None

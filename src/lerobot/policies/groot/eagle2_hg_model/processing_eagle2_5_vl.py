@@ -40,6 +40,20 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 256
 
 
+def _ensure_tensor_batch(image_inputs: BatchFeature) -> BatchFeature:
+    """Normalize image processor outputs to tensors for downstream shape logic.
+
+    Newer processor/image-processor combinations may return lists when
+    `return_tensors` is omitted. The original Eagle code expects tensors and
+    immediately reads `.shape`, so we canonicalize the fields here.
+    """
+    for key in ("pixel_values", "image_sizes"):
+        value = image_inputs.get(key)
+        if isinstance(value, list):
+            image_inputs[key] = torch.stack(value) if len(value) > 0 and isinstance(value[0], torch.Tensor) else torch.tensor(value)
+    return image_inputs
+
+
 def to_rgb(pil_image: Image.Image) -> Image.Image:
     if pil_image.mode == "RGBA":
         white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
@@ -217,10 +231,13 @@ class Eagle25VLProcessor(ProcessorMixin):
                     9: "tenth",
                 }
                 if media_type == "image":
-                    image_inputs = self.image_processor(
+                    image_inputs = _ensure_tensor_batch(
+                        self.image_processor(
                         images=[image_list[idx_in_list]],
                         videos=None,
+                        return_tensors="pt",
                         **output_kwargs["images_kwargs"],
+                    )
                     )
                     num_all_tiles = image_inputs["pixel_values"].shape[0]
                     special_placeholder = f"<image {idx_in_list + 1}>{self.image_start_token}{self.image_token * num_all_tiles * self.tokens_per_tile}{self.image_end_token}"
@@ -228,10 +245,13 @@ class Eagle25VLProcessor(ProcessorMixin):
                     num_of_images_in_this_sample += 1
 
                 elif media_type == "video":
-                    video_inputs = self.image_processor(
+                    video_inputs = _ensure_tensor_batch(
+                        self.image_processor(
                         images=None,
                         videos=[video_list[idx_in_list]],
+                        return_tensors="pt",
                         **output_kwargs["videos_kwargs"],
+                    )
                     )
                     num_all_tiles = video_inputs["pixel_values"].shape[0]
                     image_sizes = video_inputs["image_sizes"]

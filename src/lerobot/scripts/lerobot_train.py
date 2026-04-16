@@ -45,6 +45,7 @@ from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
+    prune_old_checkpoints,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -278,22 +279,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
+        }
+        if not cfg.resume:
+            processor_kwargs["preprocessor_overrides"]["normalizer_processor"] = {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
-            },
-        }
+            }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
+        if not cfg.resume:
+            postprocessor_kwargs["postprocessor_overrides"] = {
+                "unnormalizer_processor": {
+                    "stats": dataset.meta.stats,
+                    "features": policy.config.output_features,
+                    "norm_map": policy.config.normalization_mapping,
+                },
+            }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -481,6 +484,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                deleted_checkpoints = prune_old_checkpoints(
+                    checkpoint_dir.parent, cfg.save_total_limit
+                )
+                if deleted_checkpoints:
+                    deleted_names = ", ".join(path.name for path in deleted_checkpoints)
+                    logging.info(
+                        "Pruned old checkpoints after step %s: %s",
+                        step,
+                        deleted_names,
+                    )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 

@@ -52,6 +52,24 @@ DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_mo
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 
 
+def _flash_attention_is_usable() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+
+        return True
+    except Exception as exc:
+        print(f"[GROOT] flash-attn unavailable, falling back to native attention: {exc}")
+        return False
+
+
+def _select_attention_implementation(prefer_flash_attention: bool) -> str:
+    if prefer_flash_attention and _flash_attention_is_usable():
+        return "flash_attention_2"
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        return "sdpa"
+    return "eager"
+
+
 class EagleBackbone(nn.Module):
     def __init__(
         self,
@@ -82,7 +100,29 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        attn_implementation = _select_attention_implementation(use_flash_attention)
+        config._attn_implementation = attn_implementation
+        if hasattr(config, "vision_config"):
+            config.vision_config._attn_implementation = attn_implementation
+        if hasattr(config, "text_config"):
+            config.text_config._attn_implementation = attn_implementation
+
+        print(f"[GROOT] Using Eagle attention implementation: {attn_implementation}")
+        try:
+            self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        except Exception as exc:
+            if attn_implementation != "eager":
+                print(
+                    f"[GROOT] Eagle init with attention={attn_implementation} failed, retrying with eager: {exc}"
+                )
+                config._attn_implementation = "eager"
+                if hasattr(config, "vision_config"):
+                    config.vision_config._attn_implementation = "eager"
+                if hasattr(config, "text_config"):
+                    config.text_config._attn_implementation = "eager"
+                self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+            else:
+                raise
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
@@ -220,6 +260,7 @@ class GR00TN15(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self.post_init()
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model

@@ -32,6 +32,7 @@ from lerobot.utils.train_utils import (
     get_step_identifier,
     load_training_state,
     load_training_step,
+    prune_old_checkpoints,
     save_checkpoint,
     save_training_state,
     save_training_step,
@@ -70,6 +71,20 @@ def test_update_last_checkpoint(tmp_path):
     last_checkpoint = tmp_path / LAST_CHECKPOINT_LINK
     assert last_checkpoint.is_symlink()
     assert last_checkpoint.resolve() == checkpoint
+
+
+def test_prune_old_checkpoints(tmp_path):
+    for name in ["000001", "000002", "000003"]:
+        (tmp_path / name).mkdir()
+
+    update_last_checkpoint(tmp_path / "000003")
+    deleted = prune_old_checkpoints(tmp_path, keep_last=2)
+
+    assert [path.name for path in deleted] == ["000001"]
+    assert not (tmp_path / "000001").exists()
+    assert (tmp_path / "000002").exists()
+    assert (tmp_path / "000003").exists()
+    assert (tmp_path / LAST_CHECKPOINT_LINK).resolve() == (tmp_path / "000003")
 
 
 @patch("lerobot.utils.train_utils.save_training_state")

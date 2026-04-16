@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -295,6 +296,20 @@ def make_pre_post_processors(
         if isinstance(policy_cfg, SmolVLAConfig):
             tokenizer_overrides = preprocessor_overrides.setdefault("tokenizer_processor", {})
             tokenizer_overrides.setdefault("tokenizer_name", policy_cfg.vlm_model_name)
+
+        if isinstance(policy_cfg, PI0FastConfig):
+            tokenizer_overrides = preprocessor_overrides.setdefault("tokenizer_processor", {})
+            tokenizer_overrides.setdefault("tokenizer_name", policy_cfg.text_tokenizer_name)
+
+            action_tokenizer_overrides = preprocessor_overrides.setdefault(
+                "action_tokenizer_processor", {}
+            )
+            action_tokenizer_overrides.setdefault(
+                "action_tokenizer_name", policy_cfg.action_tokenizer_name
+            )
+            action_tokenizer_overrides.setdefault(
+                "paligemma_tokenizer_name", policy_cfg.text_tokenizer_name
+            )
 
         kwargs["preprocessor_overrides"] = preprocessor_overrides
         kwargs["postprocessor_overrides"] = postprocessor_overrides
